@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Response, Request
+from fastapi import FastAPI, Header, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
@@ -20,12 +20,10 @@ app.add_middleware(
 
 TOTAL_ORDERS = 59
 RATE_LIMIT = 20
-WINDOW = 10
+WINDOW = 10  # seconds
 
-# idempotency storage
+# Stores
 idempotency_store = {}
-
-# rate limit storage
 rate_limit_store = {}
 
 
@@ -38,10 +36,10 @@ class Order(BaseModel):
 
 
 # -----------------------------
-# Helpers
+# Cursor helpers
 # -----------------------------
-def encode_cursor(i: int):
-    return base64.urlsafe_b64encode(str(i).encode()).decode()
+def encode_cursor(index: int):
+    return base64.urlsafe_b64encode(str(index).encode()).decode()
 
 
 def decode_cursor(cursor: str):
@@ -57,35 +55,38 @@ def decode_cursor(cursor: str):
 # Rate Limiting Middleware
 # -----------------------------
 @app.middleware("http")
-async def limiter(request: Request, call_next):
+async def rate_limit(request: Request, call_next):
 
-    client = request.headers.get("X-Client-Id", "anonymous")
+    # Only rate-limit requests that provide X-Client-Id
+    client = request.headers.get("X-Client-Id")
 
-    now = time.time()
+    if client:
+        now = time.time()
 
-    timestamps = rate_limit_store.get(client, [])
+        timestamps = rate_limit_store.get(client, [])
 
-    timestamps = [t for t in timestamps if now - t < WINDOW]
+        # keep only last 10 seconds
+        timestamps = [t for t in timestamps if now - t < WINDOW]
 
-    if len(timestamps) >= RATE_LIMIT:
-        return Response(
-            status_code=429,
-            headers={"Retry-After": "10"},
-            content="Rate limit exceeded",
-        )
+        if len(timestamps) >= RATE_LIMIT:
+            return Response(
+                status_code=429,
+                headers={"Retry-After": "10"},
+                content="Rate limit exceeded"
+            )
 
-    timestamps.append(now)
+        timestamps.append(now)
+        rate_limit_store[client] = timestamps
 
-    rate_limit_store[client] = timestamps
-
-    return await call_next(request)
+    response = await call_next(request)
+    return response
 
 
 # -----------------------------
 # Home
 # -----------------------------
 @app.get("/")
-def home():
+def root():
     return {"status": "running"}
 
 
@@ -95,7 +96,7 @@ def health():
 
 
 # -----------------------------
-# Idempotent POST
+# POST /orders
 # -----------------------------
 @app.post("/orders", status_code=201)
 def create_order(
@@ -103,28 +104,32 @@ def create_order(
     response: Response,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
+
     if idempotency_key in idempotency_store:
         response.status_code = 200
         return idempotency_store[idempotency_key]
 
     order_id = str(uuid.uuid4())
 
-    result = {
+    created = {
         "id": order_id,
         "item": order.item,
         "quantity": order.quantity,
     }
 
-    idempotency_store[idempotency_key] = result
+    idempotency_store[idempotency_key] = created
 
-    return result
+    return created
 
 
 # -----------------------------
-# Pagination
+# GET /orders
 # -----------------------------
 @app.get("/orders")
 def list_orders(limit: int = 10, cursor: str = ""):
+
+    if limit < 1:
+        limit = 1
 
     start = decode_cursor(cursor)
 
@@ -133,12 +138,10 @@ def list_orders(limit: int = 10, cursor: str = ""):
     items = []
 
     for i in range(start + 1, end + 1):
-        items.append(
-            {
-                "id": i,
-                "item": f"Item {i}",
-            }
-        )
+        items.append({
+            "id": i,
+            "item": f"Item {i}"
+        })
 
     next_cursor = None
 
@@ -147,5 +150,5 @@ def list_orders(limit: int = 10, cursor: str = ""):
 
     return {
         "items": items,
-        "next_cursor": next_cursor,
+        "next_cursor": next_cursor
     }
