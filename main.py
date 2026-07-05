@@ -1,33 +1,33 @@
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
-import base64
 import time
+import base64
 
 app = FastAPI()
 
-# Allow CORS
+# -----------------------------
+# CORS
+# -----------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 TOTAL_ORDERS = 59
 RATE_LIMIT = 20
-WINDOW = 10  # seconds
+WINDOW = 10
 
-# -----------------------------
-# Idempotency storage
-# -----------------------------
-orders_by_key = {}
+# idempotency storage
+idempotency_store = {}
 
-# -----------------------------
-# Rate limiting storage
-# -----------------------------
-client_requests = {}
+# rate limit storage
+rate_limit_store = {}
+
 
 # -----------------------------
 # Models
@@ -36,81 +36,95 @@ class Order(BaseModel):
     item: str = "demo"
     quantity: int = 1
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
-def encode_cursor(index: int):
-    return base64.urlsafe_b64encode(str(index).encode()).decode()
+def encode_cursor(i: int):
+    return base64.urlsafe_b64encode(str(i).encode()).decode()
+
 
 def decode_cursor(cursor: str):
     if not cursor:
         return 0
     try:
         return int(base64.urlsafe_b64decode(cursor.encode()).decode())
-    except:
+    except Exception:
         return 0
 
+
 # -----------------------------
-# Middleware
+# Rate Limiting Middleware
 # -----------------------------
 @app.middleware("http")
-async def rate_limit(request, call_next):
+async def limiter(request: Request, call_next):
 
     client = request.headers.get("X-Client-Id", "anonymous")
 
     now = time.time()
 
-    timestamps = client_requests.get(client, [])
+    timestamps = rate_limit_store.get(client, [])
 
     timestamps = [t for t in timestamps if now - t < WINDOW]
 
     if len(timestamps) >= RATE_LIMIT:
         return Response(
             status_code=429,
-            headers={
-                "Retry-After": "10"
-            }
+            headers={"Retry-After": "10"},
+            content="Rate limit exceeded",
         )
 
     timestamps.append(now)
 
-    client_requests[client] = timestamps
+    rate_limit_store[client] = timestamps
 
     return await call_next(request)
 
+
 # -----------------------------
-# POST /orders
+# Home
+# -----------------------------
+@app.get("/")
+def home():
+    return {"status": "running"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# -----------------------------
+# Idempotent POST
 # -----------------------------
 @app.post("/orders", status_code=201)
 def create_order(
     order: Order,
     response: Response,
-    idempotency_key: str = Header(...)
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
+    if idempotency_key in idempotency_store:
+        response.status_code = 200
+        return idempotency_store[idempotency_key]
 
-    if idempotency_key in orders_by_key:
-        return orders_by_key[idempotency_key]
-
-    oid = str(uuid.uuid4())
+    order_id = str(uuid.uuid4())
 
     result = {
-        "id": oid,
+        "id": order_id,
         "item": order.item,
-        "quantity": order.quantity
+        "quantity": order.quantity,
     }
 
-    orders_by_key[idempotency_key] = result
+    idempotency_store[idempotency_key] = result
 
     return result
 
+
 # -----------------------------
-# GET /orders
+# Pagination
 # -----------------------------
 @app.get("/orders")
-def list_orders(
-    limit: int = 10,
-    cursor: str = ""
-):
+def list_orders(limit: int = 10, cursor: str = ""):
 
     start = decode_cursor(cursor)
 
@@ -119,9 +133,12 @@ def list_orders(
     items = []
 
     for i in range(start + 1, end + 1):
-        items.append({
-            "id": i
-        })
+        items.append(
+            {
+                "id": i,
+                "item": f"Item {i}",
+            }
+        )
 
     next_cursor = None
 
@@ -130,9 +147,5 @@ def list_orders(
 
     return {
         "items": items,
-        "next_cursor": next_cursor
+        "next_cursor": next_cursor,
     }
-
-@app.get("/")
-def home():
-    return {"status": "running"}
